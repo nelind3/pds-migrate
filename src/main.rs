@@ -1,19 +1,56 @@
 use atrium_api::{
-    agent::atp_agent::{store::MemorySessionStore, AtpAgent},
+    agent::{
+        atp_agent::{store::MemorySessionStore, AtpAgent},
+        Agent,
+    },
     app::bsky::actor::{get_preferences, put_preferences},
     com::atproto::{
-        repo::list_missing_blobs,
         server::{create_account, get_service_auth},
         sync::{get_blob, get_repo, list_blobs},
     },
-    types::string::{Handle, Nsid},
+    types::string::{Did, Handle, Nsid},
+};
+use atrium_common::resolver::Resolver;
+use atrium_identity::{
+    did::{CommonDidResolver, CommonDidResolverConfig},
+    handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig, DnsTxtResolver},
+    identity_resolver::{IdentityResolver, IdentityResolverConfig},
 };
 use atrium_xrpc_client::reqwest::ReqwestClient;
+use hickory_resolver::TokioResolver;
 use std::{
-    io::{self, Write}, sync::Arc
+    io::{self, Write},
+    sync::Arc,
 };
 
 mod jwt;
+
+struct HickoryDnsTxtResolver {
+    resolver: TokioResolver,
+}
+
+impl Default for HickoryDnsTxtResolver {
+    fn default() -> Self {
+        Self {
+            resolver: TokioResolver::builder_tokio().unwrap().build(),
+        }
+    }
+}
+
+impl DnsTxtResolver for HickoryDnsTxtResolver {
+    async fn resolve(
+        &self,
+        query: &str,
+    ) -> core::result::Result<Vec<String>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        Ok(self
+            .resolver
+            .txt_lookup(query)
+            .await?
+            .iter()
+            .map(|txt| txt.to_string())
+            .collect())
+    }
+}
 
 fn readln(message: Option<impl Into<String>>) -> std::io::Result<Arc<str>> {
     if let Some(message) = message {
@@ -28,15 +65,8 @@ fn readln(message: Option<impl Into<String>>) -> std::io::Result<Arc<str>> {
 #[tokio::main]
 async fn main() {
     println!("Please log in to your current PDS. Authenticated access is needed throughout the migration process");
-    let old_pds_url = match readln(Some("The URL of your current PDS: ")) {
+    let identifier = match readln(Some("Identifier (handle or did): ")) {
         Ok(string) => string,
-        Err(err) => {
-            println!("Could not read the URL of your current PDS due to error: {err}");
-            return;
-        }
-    };
-    let identity = match readln(Some("Identifier (handle, did or email): ")) {
-        Ok(string) => string.trim().to_string(),
         Err(err) => {
             println!("Could not read username due to error: {err}");
             return;
@@ -49,16 +79,37 @@ async fn main() {
             return;
         }
     };
-    println!("Authenticating with your PDS");
-    let old_agent = AtpAgent::new(
-        ReqwestClient::new(&old_pds_url),
+
+    let identity_resolver = IdentityResolver::new(IdentityResolverConfig {
+        did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
+            plc_directory_url: String::from("https://plc.directory"),
+            http_client: ReqwestClient::new("").into(),
+        }),
+        handle_resolver: AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
+            dns_txt_resolver: HickoryDnsTxtResolver::default(),
+            http_client: ReqwestClient::new("").into(),
+        }),
+    });
+    let identity = match identity_resolver.resolve(identifier.as_ref()).await {
+        Ok(identity) => identity,
+        Err(err) => {
+            println!("Could not resolve identity from identifier {identifier} due to error: {err}");
+            return;
+        }
+    };
+
+    let current_agent = AtpAgent::new(
+        ReqwestClient::new(&identity.pds),
         MemorySessionStore::default(),
     );
-    if let Err(err) = old_agent.login(identity, password).await {
-        println!("Failed to log in to your account on your current PDS due to error: {err}");
+    if let Err(err) = current_agent.login(identifier, password).await {
+        println!(
+            "Failed to log in to your account on your current PDS at {} due to error: {err}",
+            &identity.pds
+        );
         return;
     };
-    println!("Log in successful!");
+    println!("Log in at {} was successful!", &identity.pds);
     println!();
 
     // Create new account
@@ -134,7 +185,7 @@ async fn main() {
         }
     };
     let new_pds_did = &describe_res.did;
-    let service_jwt_res = match old_agent
+    let service_jwt_res = match current_agent
         .api
         .com
         .atproto
@@ -156,20 +207,21 @@ async fn main() {
         }
     };
 
-    let new_agent = AtpAgent::new(
-        jwt::JwtAuthedClient::new(&new_pds_url, service_jwt_res.token.clone()),
-        MemorySessionStore::default(),
-    );
-    match new_agent
+    let new_jwt_agent = Agent::new(jwt::JwtSessionManager::new(
+        Did::new(identity.did.clone()).unwrap(),
+        service_jwt_res.token.clone(),
+        &new_pds_url,
+    ));
+    match new_jwt_agent
         .api
         .com
         .atproto
         .server
         .create_account(
             create_account::InputData {
-                did: old_agent.did().await,
+                did: current_agent.did().await,
                 email: Some(email.to_string()),
-                handle,
+                handle: handle.clone(),
                 invite_code,
                 password: Some(password.to_string()),
                 plc_op: None,
@@ -187,20 +239,24 @@ async fn main() {
             return;
         }
     }
+    if let Err(err) = new_agent.login(handle.clone(), password).await {
+        println!("Failed to log in to your account on your new PDS due to error: {err}");
+        return;
+    };
     println!("Successfully created account on your new PDS!");
     println!();
 
     // Migrate data
     println!("Migrating your data");
 
-    let car = match old_agent
+    let car = match current_agent
         .api
         .com
         .atproto
         .sync
         .get_repo(
             get_repo::ParametersData {
-                did: old_agent.did().await.unwrap(),
+                did: current_agent.did().await.unwrap(),
                 since: None,
             }
             .into(),
@@ -213,6 +269,7 @@ async fn main() {
             return;
         }
     };
+    println!("CAR file downloaded");
 
     match new_agent.api.com.atproto.repo.import_repo(car).await {
         Ok(_) => (),
@@ -223,7 +280,7 @@ async fn main() {
     }
     println!("Repository successfully migrated");
 
-    let mut listed_blobs = match old_agent
+    let mut listed_blobs = match current_agent
         .api
         .com
         .atproto
@@ -231,7 +288,7 @@ async fn main() {
         .list_blobs(
             list_blobs::ParametersData {
                 cursor: None,
-                did: old_agent.did().await.unwrap(),
+                did: current_agent.did().await.unwrap(),
                 limit: None,
                 since: None,
             }
@@ -247,7 +304,7 @@ async fn main() {
     };
 
     for cid in listed_blobs.cids.iter() {
-        let blob = match old_agent
+        let blob = match current_agent
             .api
             .com
             .atproto
@@ -255,7 +312,7 @@ async fn main() {
             .get_blob(
                 get_blob::ParametersData {
                     cid: cid.to_owned(),
-                    did: old_agent.did().await.unwrap(),
+                    did: current_agent.did().await.unwrap(),
                 }
                 .into(),
             )
@@ -279,7 +336,7 @@ async fn main() {
 
     let mut cursor = listed_blobs.cursor.clone();
     while cursor.is_some() {
-        listed_blobs = match old_agent
+        listed_blobs = match current_agent
             .api
             .com
             .atproto
@@ -287,7 +344,7 @@ async fn main() {
             .list_blobs(
                 list_blobs::ParametersData {
                     cursor: cursor.clone(),
-                    did: old_agent.did().await.unwrap(),
+                    did: current_agent.did().await.unwrap(),
                     limit: None,
                     since: None,
                 }
@@ -303,7 +360,7 @@ async fn main() {
         };
 
         for cid in listed_blobs.cids.iter() {
-            let blob = match old_agent
+            let blob = match current_agent
                 .api
                 .com
                 .atproto
@@ -311,7 +368,7 @@ async fn main() {
                 .get_blob(
                     get_blob::ParametersData {
                         cid: cid.to_owned(),
-                        did: old_agent.did().await.unwrap(),
+                        did: current_agent.did().await.unwrap(),
                     }
                     .into(),
                 )
@@ -336,7 +393,7 @@ async fn main() {
     }
     println!("Blobs successfully migrated!");
 
-    let prefs = match old_agent
+    let prefs = match current_agent
         .api
         .app
         .bsky
