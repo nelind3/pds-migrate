@@ -1,6 +1,10 @@
 use atrium_api::{
     agent::atp_agent::{store::MemorySessionStore, AtpAgent},
-    com::atproto::server::{create_account, get_service_auth},
+    app::bsky::actor::{get_preferences, put_preferences},
+    com::atproto::{
+        server::{create_account, get_service_auth},
+        sync::{get_blob, get_repo, list_blobs},
+    },
     types::string::{Handle, Nsid},
 };
 use atrium_xrpc_client::reqwest::ReqwestClient;
@@ -58,7 +62,6 @@ async fn main() {
     println!();
 
     // Create new account
-    println!("First migration step is registering an account with your new PDS");
     let new_pds_url = match readln(Some(
         "Please type in the URL of the PDS you want to migrate to: ",
     )) {
@@ -68,6 +71,7 @@ async fn main() {
             return;
         }
     };
+    println!("Creating an account on your new PDS ...");
     let new_agent = AtpAgent::new(
         ReqwestClient::new(&new_pds_url),
         MemorySessionStore::default(),
@@ -177,10 +181,161 @@ async fn main() {
         )
         .await
     {
-        Ok(response) => response,
+        Ok(_) => (),
         Err(err) => {
             println!("com.atproto.server.createAccount at new PDS failed due to error: {err}");
             return;
         }
+    }
+    println!("Successfully created account on your new PDS!");
+    println!();
+
+    // Migrate data
+    println!("Migrating your data");
+
+    let car = match old_agent
+        .api
+        .com
+        .atproto
+        .sync
+        .get_repo(
+            get_repo::ParametersData {
+                did: old_agent.did().await.unwrap(),
+                since: None,
+            }
+            .into(),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            println!("com.atproto.sync.getRepo at current PDS failed due to error: {err}");
+            return;
+        }
     };
+
+    match new_agent.api.com.atproto.repo.import_repo(car).await {
+        Ok(_) => (),
+        Err(err) => {
+            println!("com.atproto.repo.importRepo at new PDS failed due to error: {err}");
+            return;
+        }
+    }
+    println!("Repository successfully migrated");
+
+    let mut listed_blobs = match old_agent
+        .api
+        .com
+        .atproto
+        .sync
+        .list_blobs(
+            list_blobs::ParametersData {
+                cursor: None,
+                did: old_agent.did().await.unwrap(),
+                limit: None,
+                since: None,
+            }
+            .into(),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            println!("com.atproto.sync.listBlobs at old PDS failed due to error: {err}");
+            return;
+        }
+    };
+
+    while listed_blobs.cursor.is_some() {
+        for cid in listed_blobs.cids.iter() {
+            let blob = match old_agent
+                .api
+                .com
+                .atproto
+                .sync
+                .get_blob(
+                    get_blob::ParametersData {
+                        cid: cid.to_owned(),
+                        did: old_agent.did().await.unwrap(),
+                    }
+                    .into(),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    println!("com.atproto.sync.getBlob at current PDS failed due to error: {err}");
+                    return;
+                }
+            };
+
+            match new_agent.api.com.atproto.repo.upload_blob(blob).await {
+                Ok(_) => (),
+                Err(err) => {
+                    println!("com.atproto.repo.uploadBlob at new PDS failed due to error: {err}");
+                    return;
+                }
+            };
+        }
+
+        listed_blobs = match old_agent
+            .api
+            .com
+            .atproto
+            .sync
+            .list_blobs(
+                list_blobs::ParametersData {
+                    cursor: listed_blobs.cursor.clone(),
+                    did: old_agent.did().await.unwrap(),
+                    limit: None,
+                    since: None,
+                }
+                .into(),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                println!("com.atproto.sync.listBlobs at old PDS failed due to error: {err}");
+                return;
+            }
+        };
+    }
+    println!("Blobs successfully migrated!");
+
+    let prefs = match old_agent
+        .api
+        .app
+        .bsky
+        .actor
+        .get_preferences(get_preferences::ParametersData {}.into())
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            println!("app.bsky.actor.getPreferences at current PDS failed due to error: {err}");
+            return;
+        }
+    };
+
+    match new_agent
+        .api
+        .app
+        .bsky
+        .actor
+        .put_preferences(
+            put_preferences::InputData {
+                preferences: prefs.preferences.clone(),
+            }
+            .into(),
+        )
+        .await
+    {
+        Ok(_) => (),
+        Err(err) => {
+            println!("app.bsky.actor.putPreferences at new PDS failed due to error: {err}");
+            return;
+        }
+    }
+    println!("Preferences successfully migrated!");
 }
