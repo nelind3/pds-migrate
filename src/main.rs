@@ -176,7 +176,6 @@ async fn main() {
         }
     };
 
-    let password = password.clone();
     let describe_res = match new_agent.api.com.atproto.server.describe_server().await {
         Ok(response) => response,
         Err(err) => {
@@ -269,7 +268,7 @@ async fn main() {
             return;
         }
     };
-    println!("CAR file downloaded");
+    println!("Repository downloaded from old PDS. Importing to new PDS.");
 
     match new_agent.api.com.atproto.repo.import_repo(car).await {
         Ok(_) => (),
@@ -326,7 +325,9 @@ async fn main() {
         };
 
         match new_agent.api.com.atproto.repo.upload_blob(blob).await {
-            Ok(_) => (),
+            Ok(_) => {
+                println!("Blob with CID {:?} migrated", cid)
+            },
             Err(err) => {
                 println!("com.atproto.repo.uploadBlob at new PDS failed due to error: {err}");
                 return;
@@ -382,7 +383,9 @@ async fn main() {
             };
 
             match new_agent.api.com.atproto.repo.upload_blob(blob).await {
-                Ok(_) => (),
+                Ok(_) => {
+                    println!("Blob with CID {:?} migrated", cid)
+                },
                 Err(err) => {
                     println!("com.atproto.repo.uploadBlob at new PDS failed due to error: {err}");
                     return;
