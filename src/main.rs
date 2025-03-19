@@ -2,6 +2,7 @@ use atrium_api::{
     agent::atp_agent::{store::MemorySessionStore, AtpAgent},
     app::bsky::actor::{get_preferences, put_preferences},
     com::atproto::{
+        repo::list_missing_blobs,
         server::{create_account, get_service_auth},
         sync::{get_blob, get_repo, list_blobs},
     },
@@ -9,8 +10,7 @@ use atrium_api::{
 };
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use std::{
-    io::{self, Write},
-    sync::Arc,
+    io::{self, Write}, sync::Arc
 };
 
 mod jwt;
@@ -246,7 +246,62 @@ async fn main() {
         }
     };
 
-    while listed_blobs.cursor.is_some() {
+    for cid in listed_blobs.cids.iter() {
+        let blob = match old_agent
+            .api
+            .com
+            .atproto
+            .sync
+            .get_blob(
+                get_blob::ParametersData {
+                    cid: cid.to_owned(),
+                    did: old_agent.did().await.unwrap(),
+                }
+                .into(),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                println!("com.atproto.sync.getBlob at current PDS failed due to error: {err}");
+                return;
+            }
+        };
+
+        match new_agent.api.com.atproto.repo.upload_blob(blob).await {
+            Ok(_) => (),
+            Err(err) => {
+                println!("com.atproto.repo.uploadBlob at new PDS failed due to error: {err}");
+                return;
+            }
+        };
+    }
+
+    let mut cursor = listed_blobs.cursor.clone();
+    while cursor.is_some() {
+        listed_blobs = match old_agent
+            .api
+            .com
+            .atproto
+            .sync
+            .list_blobs(
+                list_blobs::ParametersData {
+                    cursor: cursor.clone(),
+                    did: old_agent.did().await.unwrap(),
+                    limit: None,
+                    since: None,
+                }
+                .into(),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                println!("com.atproto.sync.listBlobs at old PDS failed due to error: {err}");
+                return;
+            }
+        };
+
         for cid in listed_blobs.cids.iter() {
             let blob = match old_agent
                 .api
@@ -277,29 +332,7 @@ async fn main() {
                 }
             };
         }
-
-        listed_blobs = match old_agent
-            .api
-            .com
-            .atproto
-            .sync
-            .list_blobs(
-                list_blobs::ParametersData {
-                    cursor: listed_blobs.cursor.clone(),
-                    did: old_agent.did().await.unwrap(),
-                    limit: None,
-                    since: None,
-                }
-                .into(),
-            )
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                println!("com.atproto.sync.listBlobs at old PDS failed due to error: {err}");
-                return;
-            }
-        };
+        cursor = listed_blobs.cursor.clone();
     }
     println!("Blobs successfully migrated!");
 
