@@ -6,7 +6,10 @@ edition = "2021"
 [dependencies]
 atrium-api = { version = "0.25.0", default-features = false, features = ["agent", "bluesky"] }
 atrium-common = "0.1.0"
+atrium-crypto = "0.1.2"
 atrium-identity = { version = "0.1.1", features = ["doh-handle-resolver"] }
 atrium-xrpc-client = "0.5.11"
+hex = "0.4.3"
 hickory-resolver = "0.25.1"
+rand = "0.8.5"
 tokio = { version = "1.44.0", features = ["macros", "rt-multi-thread"]}

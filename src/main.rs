@@ -5,12 +5,14 @@ use atrium_api::{
     },
     app::bsky::actor::{get_preferences, put_preferences},
     com::atproto::{
-        server::{create_account, get_service_auth},
+        identity::sign_plc_operation,
+        server::{create_account, deactivate_account, get_service_auth},
         sync::{get_blob, get_repo, list_blobs},
     },
     types::string::{Did, Handle, Nsid},
 };
 use atrium_common::resolver::Resolver;
+use atrium_crypto::keypair::{Did as _, Export, Secp256k1Keypair};
 use atrium_identity::{
     did::{CommonDidResolver, CommonDidResolverConfig},
     handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig, DnsTxtResolver},
@@ -327,7 +329,7 @@ async fn main() {
         match new_agent.api.com.atproto.repo.upload_blob(blob).await {
             Ok(_) => {
                 println!("Blob with CID {:?} migrated", cid)
-            },
+            }
             Err(err) => {
                 println!("com.atproto.repo.uploadBlob at new PDS failed due to error: {err}");
                 return;
@@ -385,7 +387,7 @@ async fn main() {
             match new_agent.api.com.atproto.repo.upload_blob(blob).await {
                 Ok(_) => {
                     println!("Blob with CID {:?} migrated", cid)
-                },
+                }
                 Err(err) => {
                     println!("com.atproto.repo.uploadBlob at new PDS failed due to error: {err}");
                     return;
@@ -431,4 +433,141 @@ async fn main() {
         }
     }
     println!("Preferences successfully migrated!");
+
+    // Update identity
+    println!("Migrating you identity (DID document) ...");
+
+    let pds_credentials = match new_agent
+        .api
+        .com
+        .atproto
+        .identity
+        .get_recommended_did_credentials()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            println!("com.atproto.identity.getRecommendedDidCredentials at new PDS failed due to error: {err}");
+            return;
+        }
+    };
+
+    match Did::new(identity.did.clone()).unwrap().method() {
+        "plc" => {
+            println!(
+                "did:plc detected! Creating a recovery key and updating your DID document ..."
+            );
+            let recovery_keypair = Secp256k1Keypair::create(&mut rand::thread_rng());
+            let private_key = hex::encode(recovery_keypair.export());
+            let mut recovery_keys = vec![recovery_keypair.did()];
+            if let Some(keys) = pds_credentials.rotation_keys.clone() {
+                recovery_keys.extend(keys);
+            }
+
+            println!("PLC operations are potentially destructive therefore you will need to complete an email challenge with your current PDS");
+            if let Err(err) = current_agent
+                .api
+                .com
+                .atproto
+                .identity
+                .request_plc_operation_signature()
+                .await
+            {
+                println!("com.atproto.identity.requestPlcOperationSignature at current PDS failed due to error: {err}")
+            };
+            let challenge_token = match readln(Some(
+                "Challenge email sent. Please provide the token you where sent over email here",
+            )) {
+                Ok(token) => token,
+                Err(err) => {
+                    println!("Could not read token due to error: {err}");
+                    return;
+                }
+            };
+            println!("Your private recovery key is {private_key}. Please store this in a secure location!!");
+            if let Err(err) = readln(Some("Press enter once you've saved the key securely")) {
+                println!("Could not handle enter due to error: {err}");
+                return;
+            }
+
+            match current_agent
+                .api
+                .com
+                .atproto
+                .identity
+                .sign_plc_operation(
+                    sign_plc_operation::InputData {
+                        also_known_as: pds_credentials.also_known_as.clone(),
+                        rotation_keys: Some(recovery_keys),
+                        services: pds_credentials.services.clone(),
+                        token: Some(challenge_token.to_string()),
+                        verification_methods: pds_credentials.verification_methods.clone(),
+                    }
+                    .into(),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    println!("com.atproto.identity.signPlcOperation at current PDS failed due to error: {err}");
+                    return;
+                }
+            };
+            println!("DID document successfully updated!");
+        }
+        "web" => {
+            let did = identity.did;
+            println!("did:web detected! Please manually update your DID document to match these values: {pds_credentials:#?}");
+            if let Err(err) = readln(Some("Press enter once you've updated your DID document")) {
+                println!("Could not handle enter due to error: {err}");
+                return;
+            }
+            let mut valid_document = match identity_resolver.resolve(did.as_str()).await {
+                Ok(response) => response.pds == new_pds_url.to_string(),
+                Err(err) => {
+                    println!("Couldn't resolve DID {did} due to error: {err}");
+                    return;
+                }
+            };
+
+            while !valid_document {
+                println!("DID document not updated or updated incorretly! Needed PDS configuration: {new_pds_url}");
+                if let Err(err) = readln(Some("Press enter once you've updated your DID document"))
+                {
+                    println!("Could not handle enter due to error: {err}");
+                    return;
+                }
+                valid_document = match identity_resolver.resolve(did.as_str()).await {
+                    Ok(response) => response.pds == new_pds_url.to_string(),
+                    Err(err) => {
+                        println!("Couldn't resolve DID {did} due to error: {err}");
+                        return;
+                    }
+                };
+            }
+        }
+        _ => {
+            println!("Unknown and invalid DID method found. This should not be possible!");
+            return;
+        }
+    }
+    println!("Identity migrated successfully!");
+
+    // Finalise migration
+    if let Err(err) = new_agent.api.com.atproto.server.activate_account().await {
+        println!("com.atproto.server.activateAccount at new PDS failed due to error: {err}")
+    };
+    if let Err(err) = current_agent
+        .api
+        .com
+        .atproto
+        .server
+        .deactivate_account(deactivate_account::InputData { delete_after: None }.into())
+        .await
+    {
+        println!("com.atproto.server.activateAccount at current PDS failed due to error: {err}")
+    };
+
+    println!("The account migration was successful!");
+    println!("The account on your old PDS has been deactivated. Please make sure everything works before fully deleting it in case you need to go back");
 }
