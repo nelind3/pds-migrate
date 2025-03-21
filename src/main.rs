@@ -154,7 +154,7 @@ async fn main() {
         }
     };
     let password = match readln(Some(
-        "Please type in the password you want to use on your new PDS",
+        "Please type in the password you want to use on your new PDS: ",
     )) {
         Ok(string) => string,
         Err(err) => {
